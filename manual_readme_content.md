@@ -106,3 +106,57 @@ steps and select Entitlements - Read (vso.entitlements), User Profile -
 Read&Write(vso.memberentitlementmanagement_write), and Work Items - Read & Write (vso.work)
 scopes. Do not grant broader Personal Access Token scopes unless another integration requires
 them.
+
+### OAuth token refresh
+
+For interactive authentication, a rejected access token (HTTP 401 or legacy HTTP 203)
+triggers a refresh using the stored refresh token and one retry of the original request.
+Basic authentication does not use this refresh path. If refresh fails, the action reports
+an error; run Test Connectivity again when interactive authorization is required.
+
+### Listing work items by iteration
+
+Use **list work items** with a team and `current`, `future`, `past`, or an explicit
+iteration path. Future selects the nearest upcoming iteration; past selects the most
+recently completed iteration. Undated iterations are ignored for date-based selection.
+Optionally filter by work item type, select comma-separated fields, or expand details.
+Field selection and expansion are mutually exclusive; the default `None` expansion
+allows field selection. Resolved iteration names and paths appear in the summary.
+
+Results are fetched in batches of 200 and bounded to 10,000 items and 20 MiB of cumulative
+API response data. Narrow the selection if a limit is exceeded.
+
+### Updating work items
+
+Use **update work item** with a work item ID and a JSON array of patch operations.
+For example, `[ {"op": "add", "path": "/fields/System.Title", "value": "Updated title"} ]`
+sets the title. The response contains the updated work item, with field-name dots
+replaced by dashes, consistent with get work item. Write permission is required.
+
+### Querying work items with WIQL
+
+Use **query work items** with a WIQL query and optional comma-separated fields.
+For example: `SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = @project`.
+Flat queries hydrate returned IDs; link/tree queries hydrate unique target IDs.
+The action returns work item details rather than the original relationship graph.
+Batch retrieval uses the WIQL response timestamp, including for historical ASOF queries.
+Field-name dots are replaced by dashes in the result.
+
+Results are fetched in batches of 200 and bounded to 10,000 items and 20 MiB of cumulative
+API response data. Narrow the query if a limit is exceeded. This action can be called
+from a scheduled playbook; it does not provide an on-poll ingestion action.
+
+### Team work item templates
+
+Use **list templates** with a team ID or name to discover templates. Use **get template**
+with that team and a returned template ID to retrieve a template and its field values.
+Both actions are read-only and require work-item read permission.
+
+### Wiki pages
+
+Use **get wiki pages** with a wiki ID or name. The page path defaults to `/` and
+recursion defaults to `oneLevel`; `none` and `full` are also supported. The action
+requests page content and returns the page response, including available subpages.
+Wiki read permission (`vso.wiki` for OAuth) is required in addition to permissions
+needed by the other actions. Existing registrations may need this permission and
+renewed consent before accessing a wiki.

@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import urllib.parse as urlparse
+from datetime import datetime, timezone
 
 import encryption_helper
 import phantom.app as phantom
@@ -346,6 +347,7 @@ class AzureDevopsConnector(BaseConnector):
         self._auth_type = None
         self._tenant_id = None
         self._last_response_size = 0
+        self._last_http_status = None
 
     def encrypt_state(self, encrypt_var):
         """Handle encryption of token.
@@ -425,6 +427,7 @@ class AzureDevopsConnector(BaseConnector):
         return RetVal(action_result.set_status(phantom.APP_ERROR, message), None)
 
     def _process_response(self, r, action_result):
+        self._last_http_status = r.status_code
         # store the r_text in debug data, it will get dumped in the logs if the action fails
         if hasattr(action_result, "add_debug_data"):
             action_result.add_debug_data({"r_status_code": r.status_code})
@@ -636,6 +639,7 @@ class AzureDevopsConnector(BaseConnector):
         if kwargs.get("params"):
             params.update(**kwargs.get("params"))
 
+        self._last_http_status = None
         ret_val, resp_json = self._make_rest_call(
             endpoint,
             action_result,
@@ -648,9 +652,11 @@ class AzureDevopsConnector(BaseConnector):
             skip_base_url=skip_base_url,
         )
 
-        if consts.BAD_TOKEN_MATCH_STRING in action_result.get_message():
-            self.save_progress("bad token")
-            self._get_token(action_result=action_result)
+        if not self._password and self._last_http_status in (203, 401):
+            self.save_progress("Access token rejected; refreshing token and retrying once")
+            token_ret_val = self._get_token(action_result=action_result)
+            if phantom.is_fail(token_ret_val):
+                return action_result.get_status(), None
             headers.update({"Authorization": f"Bearer {self._access_token}"})
             ret_val, resp_json = self._make_rest_call(
                 endpoint,
@@ -1058,7 +1064,7 @@ class AzureDevopsConnector(BaseConnector):
         if asof:
             params["asOf"] = asof
         if fields:
-            params["fields"] = fields
+            params["fields"] = ",".join(field.strip() for field in fields.split(","))
 
         ret_val, response = self._make_rest_call_helper(
             f"{consts.WORK_ITEMS}/{work_item_id}",
@@ -1407,6 +1413,12 @@ class AzureDevopsConnector(BaseConnector):
         :return str: base url string
         """
         action_to_url_mapping_dict = {
+            "get_wiki_pages": self._base_url,
+            "list_templates": self._base_url,
+            "get_template": self._base_url,
+            "query_work_items": self._base_url,
+            "update_work_item": self._base_url,
+            "list_work_items": self._base_url,
             "delete_user": self._user_entitlement_base_url,
             "search_users": self._user_entitlement_base_url,
             "add_user": self._user_entitlement_base_url,
@@ -1502,6 +1514,392 @@ class AzureDevopsConnector(BaseConnector):
         # For now return Error with a message, in case of success we don't set the message, but use the summary
         # return action_result.set_status(phantom.APP_ERROR, "Action not yet implemented")
 
+    def _get_work_item_batch(self, ids, action_result, fields=None, expand=None, asof=None, response_bytes=None):
+        """Hydrate IDs in bounded batches while retaining upstream response limits."""
+        if len(ids) > consts.AZURE_DEVOPS_MAX_PAGINATION_ITEMS:
+            return action_result.set_status(phantom.APP_ERROR, "Too many work items; narrow the query"), None
+        items = []
+        if response_bytes is None:
+            response_bytes = self._last_response_size
+        if response_bytes > consts.AZURE_DEVOPS_MAX_PAGINATION_BYTES:
+            return action_result.set_status(phantom.APP_ERROR, "Work item results exceeded the response byte limit"), None
+        for start in range(0, len(ids), 200):
+            body = {"ids": ids[start : start + 200]}
+            if asof:
+                body["asOf"] = asof
+            if fields:
+                body["fields"] = [field.strip() for field in fields.split(",") if field.strip()]
+            elif expand is not None:
+                body["$expand"] = expand
+            ret_val, response = self._make_rest_call_helper(consts.WORK_ITEMS_BATCH, action_result, method="post", json=body)
+            if phantom.is_fail(ret_val):
+                return action_result.get_status(), None
+            if response is None:
+                return action_result.set_status(phantom.APP_ERROR, "Empty work items batch response"), None
+            response_bytes += self._last_response_size
+            if response_bytes > consts.AZURE_DEVOPS_MAX_PAGINATION_BYTES:
+                return action_result.set_status(phantom.APP_ERROR, "Work item results exceeded the response byte limit"), None
+            for item in response.get("value", []):
+                item["fields"] = {key.replace(".", "-"): value for key, value in item.get("fields", {}).items()}
+                items.append(item)
+            if len(items) > consts.AZURE_DEVOPS_MAX_PAGINATION_ITEMS:
+                return action_result.set_status(phantom.APP_ERROR, "Work item results exceeded the item limit"), None
+        return phantom.APP_SUCCESS, items
+
+    def _handle_list_work_items(self, param: dict):
+        self.save_progress(f"In action handler for: {self.get_action_identifier()}")
+
+        action_result = self.add_action_result(ActionResult(dict(param)))
+
+        team = param["team"]
+        iteration = param["iteration"]
+        work_item_type = param.get("work_item_type")
+        expand = param.get("expand")
+        if expand == "None":
+            expand = None
+        fields_param = param.get("fields")
+
+        if fields_param and expand is not None:
+            return action_result.set_status(
+                phantom.APP_ERROR,
+                "The 'fields' and 'expand' parameters are mutually exclusive. "
+                "Provide one or the other: use 'fields' to limit which fields are returned, "
+                "or 'expand' to include relations/links alongside all default fields.",
+            )
+
+        response_bytes = 0
+
+        # Resolve the iteration clause for the WIQL query
+        iteration_lower = iteration.strip().lower()
+        resolved_iteration_name = None
+        resolved_iteration_path = None
+        if iteration_lower == "current":
+            iteration_clause = f"[System.IterationPath] = @currentIteration('[{self._project.replace(chr(39), chr(39) * 2)}]\\{team.replace(chr(39), chr(39) * 2)}')"
+        elif iteration_lower in ("future", "past"):
+            endpoint = consts.ITERATIONS_TEAM.format(team=_quote_path_segment(team))
+            ret_val, iter_response = self._make_rest_call_helper(endpoint, action_result, method="get")
+            if phantom.is_fail(ret_val):
+                return action_result.get_status()
+
+            response_bytes += self._last_response_size
+            if iter_response is None:
+                return action_result.set_status(phantom.APP_ERROR, "Empty response from iterations endpoint")
+
+            now = datetime.now(timezone.utc)
+
+            def iteration_date(item, field):
+                value = item.get("attributes", {}).get(field)
+                if not value:
+                    return None
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    return None
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+            all_iterations = iter_response.get("value", [])
+
+            if iteration_lower == "future":
+                candidates = [
+                    it for it in all_iterations if iteration_date(it, "startDate") is not None and iteration_date(it, "startDate") > now
+                ]
+                if not candidates:
+                    return action_result.set_status(phantom.APP_ERROR, "No future iterations found")
+                # Nearest upcoming — smallest startDate
+                candidates.sort(key=lambda it: iteration_date(it, "startDate"))
+                resolved_iter = candidates[0]
+            else:
+                candidates = [
+                    it for it in all_iterations if iteration_date(it, "finishDate") is not None and iteration_date(it, "finishDate") < now
+                ]
+                if not candidates:
+                    return action_result.set_status(phantom.APP_ERROR, "No past iterations found")
+                # Most recently completed — largest finishDate
+                candidates.sort(key=lambda it: iteration_date(it, "finishDate"), reverse=True)
+                resolved_iter = candidates[0]
+
+            resolved_iteration_path = resolved_iter.get("path", "")
+            resolved_iteration_name = resolved_iter.get("name", "")
+            if not resolved_iteration_path:
+                return action_result.set_status(phantom.APP_ERROR, f"Resolved {iteration_lower} iteration has no path")
+
+            safe_path = resolved_iteration_path.replace("'", "''")
+            iteration_clause = f"[System.IterationPath] = '{safe_path}'"
+        else:
+            safe_iteration = iteration.replace("'", "''")
+            iteration_clause = f"[System.IterationPath] = '{safe_iteration}'"
+
+        # Build WIQL query — escape single quotes in user-supplied values
+        where_clauses = ["[System.TeamProject] = @project", iteration_clause]
+        if work_item_type:
+            safe_type = work_item_type.replace("'", "''")
+            where_clauses.append(f"[System.WorkItemType] = '{safe_type}'")
+
+        wiql_query = "SELECT [System.Id] FROM WorkItems WHERE {} ORDER BY [System.Id]".format(" AND ".join(where_clauses))
+
+        ret_val, wiql_response = self._make_rest_call_helper(
+            f"/{_quote_path_segment(team)}{consts.WIQL}",
+            action_result,
+            method="post",
+            json={"query": wiql_query},
+        )
+        if phantom.is_fail(ret_val):
+            return action_result.get_status()
+
+        if wiql_response is None:
+            return action_result.set_status(phantom.APP_ERROR, "Empty response from WIQL endpoint")
+
+        response_bytes += self._last_response_size
+        if response_bytes > consts.AZURE_DEVOPS_MAX_PAGINATION_BYTES:
+            return action_result.set_status(phantom.APP_ERROR, "Work item results exceeded the response byte limit")
+        work_item_refs = wiql_response.get("workItems", [])
+        if not work_item_refs:
+            action_result.add_data({"workItems": [], "count": 0})
+            summary = action_result.update_summary({})
+            summary["total_work_items"] = 0
+            if resolved_iteration_name is not None:
+                summary["resolved_iteration_name"] = resolved_iteration_name
+            if resolved_iteration_path is not None:
+                summary["resolved_iteration_path"] = resolved_iteration_path
+            return action_result.set_status(phantom.APP_SUCCESS)
+
+        ids = [item["id"] for item in work_item_refs]
+
+        ret_val, work_items = self._get_work_item_batch(ids, action_result, fields_param, expand, wiql_response.get("asOf"), response_bytes)
+        if phantom.is_fail(ret_val):
+            return action_result.get_status()
+
+        action_result.add_data({"workItems": work_items, "count": len(work_items)})
+
+        summary = action_result.update_summary({})
+        summary["total_work_items"] = len(work_items)
+        if resolved_iteration_name is not None:
+            summary["resolved_iteration_name"] = resolved_iteration_name
+        if resolved_iteration_path is not None:
+            summary["resolved_iteration_path"] = resolved_iteration_path
+
+        self.debug_print(f"Retrieved {len(work_items)} work items successfully")
+
+        return action_result.set_status(phantom.APP_SUCCESS)
+
+    def _handle_update_work_item(self, param: dict):
+        self.save_progress(f"In action handler for: {self.get_action_identifier()}")
+        action_result = self.add_action_result(ActionResult(dict(param)))
+
+        work_item_id = _parse_work_item_id(param["work_item_id"], action_result)
+        if work_item_id is None:
+            return action_result.get_status()
+        post_body = param["post_body"]
+
+        try:
+            patch_ops = json.loads(post_body)
+        except (ValueError, TypeError) as e:
+            return action_result.set_status(
+                phantom.APP_ERROR,
+                f"Invalid JSON in 'post_body': {e}",
+            )
+
+        if not isinstance(patch_ops, list):
+            return action_result.set_status(
+                phantom.APP_ERROR,
+                "'post_body' must be a JSON array of patch operations.",
+            )
+
+        ret_val, response = self._make_rest_call_helper(
+            f"{consts.WORK_ITEMS}/{work_item_id}",
+            action_result,
+            method="patch",
+            json=patch_ops,
+            headers={"Content-Type": consts.APPLICATION_JSON_PATCH_HEADER},
+        )
+        if phantom.is_fail(ret_val):
+            return action_result.get_status()
+
+        if response is None:
+            return action_result.set_status(phantom.APP_ERROR, "Empty response from update work item endpoint")
+
+        temp_fields = {}
+        for key, val in response.get("fields", {}).items():
+            temp_fields[key.replace(".", "-")] = val
+        response["fields"] = temp_fields
+        action_result.add_data(response)
+
+        summary = action_result.update_summary({})
+        summary["status"] = f"Work item {work_item_id} updated successfully"
+
+        self.debug_print(f"Work item {work_item_id} updated successfully")
+        return action_result.set_status(phantom.APP_SUCCESS)
+
+    def _handle_query_work_items(self, param: dict):
+        """Execute a raw WIQL query and return matching work items with their fields.
+
+        Accepts any valid WIQL string so callers (e.g. playbooks) can express arbitrary
+        filters — parent/child hierarchy, ChangedDate ranges, custom field conditions, etc. —
+        without being constrained by the fixed parameters of 'list work items'.
+
+        The action runs the WIQL query to obtain work item IDs, then batch-fetches full field
+        data in chunks of 200 (the workitemsbatch API limit). An optional 'fields' parameter
+        limits which fields are returned per item; without it all default fields are returned.
+        """
+        self.save_progress(f"In action handler for: {self.get_action_identifier()}")
+        action_result = self.add_action_result(ActionResult(dict(param)))
+
+        wiql_query = param["wiql_query"].strip()
+        fields_param = param.get("fields")
+        if not wiql_query:
+            return action_result.set_status(phantom.APP_ERROR, "WIQL query must not be empty")
+
+        # Execute the WIQL query to get matching work item IDs.
+        ret_val, wiql_response = self._make_rest_call_helper(
+            consts.WIQL,
+            action_result,
+            method="post",
+            json={"query": wiql_query},
+        )
+        if phantom.is_fail(ret_val):
+            return action_result.get_status()
+
+        if wiql_response is None:
+            return action_result.set_status(phantom.APP_ERROR, "Empty response from WIQL endpoint")
+
+        # WIQL returns either workItems (flat) or workItemRelations (tree/link queries).
+        # For WorkItemLinks / recursive queries the IDs live in the target of each relation.
+        raw_refs = wiql_response.get("workItems") or []
+        if not raw_refs:
+            relations = wiql_response.get("workItemRelations") or []
+            seen = set()
+            for rel in relations:
+                target = rel.get("target")
+                if target and target.get("id") and target["id"] not in seen:
+                    seen.add(target["id"])
+                    raw_refs.append(target)
+
+        if not raw_refs:
+            action_result.add_data({"workItems": [], "count": 0})
+            summary = action_result.update_summary({})
+            summary["total_work_items"] = 0
+            return action_result.set_status(phantom.APP_SUCCESS, "WIQL query returned no results")
+
+        ids = [item["id"] for item in raw_refs]
+
+        ret_val, all_items = self._get_work_item_batch(ids, action_result, fields_param, asof=wiql_response.get("asOf"))
+        if phantom.is_fail(ret_val):
+            return action_result.get_status()
+
+        action_result.add_data({"workItems": all_items, "count": len(all_items)})
+        summary = action_result.update_summary({})
+        summary["total_work_items"] = len(all_items)
+
+        self.debug_print(f"query_work_items returned {len(all_items)} item(s)")
+        return action_result.set_status(phantom.APP_SUCCESS)
+
+    def _handle_get_template(self, param: dict):
+        self.save_progress(f"In action handler for: {self.get_action_identifier()}")
+
+        action_result = self.add_action_result(ActionResult(dict(param)))
+
+        template_id = _quote_path_segment(param["template_id"])
+        team = _quote_path_segment(param["team"])
+        full_url = f"/{team}{consts.TEMPLATES}/{template_id}"
+
+        ret_val, response = self._make_rest_call_helper(
+            full_url,
+            action_result,
+            method="get",
+        )
+
+        if phantom.is_fail(ret_val):
+            return action_result.get_status()
+
+        if response is None:
+            return action_result.set_status(phantom.APP_ERROR, "Empty template response")
+        action_result.add_data(response)
+
+        summary = action_result.update_summary({})
+        summary["template_id"] = template_id
+        summary["template_name"] = response.get("name", "Unknown")
+        summary["work_item_type"] = response.get("workItemTypeName", "Unknown")
+
+        self.debug_print(f"Template {template_id} retrieved successfully")
+
+        return action_result.set_status(phantom.APP_SUCCESS)
+
+    def _handle_list_templates(self, param):
+        # Implement the handler here
+        # use self.save_progress(...) to send progress messages back to the platform
+        self.save_progress(f"In action handler for: {self.get_action_identifier()}")
+
+        # Add an action result object to self (BaseConnector) to represent the action for this param
+        action_result = self.add_action_result(ActionResult(dict(param)))
+
+        # Access action parameters passed in the 'param' dictionary
+
+        # Required values can be accessed directly
+        team = _quote_path_segment(param["team"])
+
+        full_url = f"/{team}{consts.TEMPLATES}"
+
+        # make rest call
+        ret_val, response = self._make_rest_call_helper(full_url, action_result, method="get")
+
+        if phantom.is_fail(ret_val):
+            return action_result.get_status()
+
+        if response is None:
+            return action_result.set_status(phantom.APP_ERROR, "Empty template response")
+        action_result.add_data(response)
+
+        summary = action_result.update_summary({})
+        summary["total_templates"] = response.get("count", len(response.get("value", [])))
+
+        self.debug_print("Templates retrieved successfully")
+
+        return action_result.set_status(phantom.APP_SUCCESS)
+
+    def _handle_get_wiki_pages(self, param):
+        # Implement the handler here
+        # use self.save_progress(...) to send progress messages back to the platform
+        self.save_progress(f"In action handler for: {self.get_action_identifier()}")
+
+        # Add an action result object to self (BaseConnector) to represent the action for this param
+        action_result = self.add_action_result(ActionResult(dict(param)))
+
+        wikiidentifier = _quote_path_segment(param["wikiidentifier"])
+        recursionLevel = param.get("recursionlevel", "oneLevel")
+        page_path = param.get("path", "/")
+
+        params = {
+            "path": page_path,
+            "recursionLevel": recursionLevel,
+            "includeContent": "true",
+        }
+
+        full_url = f"{consts.WIKI_PAGES}/{wikiidentifier}/pages"
+
+        # make rest call
+        ret_val, response = self._make_rest_call_helper(
+            full_url,
+            action_result,
+            method="get",
+            params=params,
+        )
+        if phantom.is_fail(ret_val):
+            # the call to the 3rd party device or service failed, action result should contain all the error details
+            # for now the return is commented out, but after implementation, return from here
+            return action_result.get_status()
+
+        # Add the response into the data section
+        if response is None:
+            return action_result.set_status(phantom.APP_ERROR, "Empty wiki page response")
+        action_result.add_data(response)
+
+        summary = action_result.update_summary({})
+        summary["page_path"] = response.get("path", page_path)
+        summary["page_id"] = response.get("id", "Unknown")
+        summary["sub_page_count"] = len(response.get("subPages", []))
+
+        return action_result.set_status(phantom.APP_SUCCESS)
+
     def handle_action(self, param):
         ret_val = phantom.APP_SUCCESS
 
@@ -1533,6 +1931,24 @@ class AzureDevopsConnector(BaseConnector):
 
         if action_id == "add_attachment":
             ret_val = self._handle_add_attachment(param)
+
+        if action_id == "list_work_items":
+            ret_val = self._handle_list_work_items(param)
+
+        if action_id == "update_work_item":
+            ret_val = self._handle_update_work_item(param)
+
+        if action_id == "query_work_items":
+            ret_val = self._handle_query_work_items(param)
+
+        if action_id == "get_template":
+            ret_val = self._handle_get_template(param)
+
+        if action_id == "list_templates":
+            ret_val = self._handle_list_templates(param)
+
+        if action_id == "get_wiki_pages":
+            ret_val = self._handle_get_wiki_pages(param)
 
         if action_id == "test_connectivity":
             ret_val = self._handle_test_connectivity(param)
